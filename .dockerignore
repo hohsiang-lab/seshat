@@ -1,0 +1,12 @@
+.git
+.github
+.hermes
+target
+worktrees
+.env
+.env.*
+*.env
+*.key
+*.secret
+keys/
+secrets/
