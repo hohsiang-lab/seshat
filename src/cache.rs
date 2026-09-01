@@ -1,7 +1,8 @@
 use sha2::{Digest, Sha256};
-use std::time::{Duration, SystemTime};
+use std::time::{Duration, Instant, SystemTime};
 
-use crate::providers::{ScrapeInput, SearchInput};
+use crate::config::CacheConfig;
+use crate::providers::{MAX_UPSTREAM_BODY_BYTES, ScrapeInput, SearchInput};
 
 pub(crate) const CACHE_VERSION: u8 = 1;
 
@@ -131,6 +132,360 @@ pub(crate) fn cache_freshness(modified: SystemTime, now: SystemTime, ttl: Durati
     } else {
         Freshness::Fresh
     }
+}
+
+const CACHE_IO_TIMEOUT: Duration = Duration::from_secs(1);
+const MAX_CACHE_OBJECT_BYTES: usize = MAX_UPSTREAM_BODY_BYTES;
+const SMALL_CACHE_OBJECT_BYTES: usize = 1024 * 1024;
+
+#[derive(Clone)]
+pub(crate) struct CacheStore {
+    client: aws_sdk_s3::Client,
+    bucket: String,
+    search_ttl: Duration,
+    scrape_ttl: Duration,
+}
+
+#[derive(Clone, Copy, Debug, PartialEq, Eq)]
+enum CacheOutcome {
+    Hit,
+    Missing,
+    Expired,
+    Invalid,
+    Unavailable,
+    Stored,
+    WriteFailed,
+}
+
+impl CacheOutcome {
+    fn as_str(self) -> &'static str {
+        match self {
+            Self::Hit => "hit",
+            Self::Missing => "missing",
+            Self::Expired => "expired",
+            Self::Invalid => "invalid",
+            Self::Unavailable => "unavailable",
+            Self::Stored => "stored",
+            Self::WriteFailed => "write_failed",
+        }
+    }
+}
+
+#[derive(Clone, Copy, Debug, PartialEq, Eq)]
+enum ObjectSizeClass {
+    Empty,
+    Small,
+    Large,
+    Oversized,
+    Unknown,
+}
+
+impl ObjectSizeClass {
+    fn as_str(self) -> &'static str {
+        match self {
+            Self::Empty => "empty",
+            Self::Small => "small",
+            Self::Large => "large",
+            Self::Oversized => "oversized",
+            Self::Unknown => "unknown",
+        }
+    }
+}
+
+fn object_size_class(size: Option<usize>) -> ObjectSizeClass {
+    match size {
+        None => ObjectSizeClass::Unknown,
+        Some(0) => ObjectSizeClass::Empty,
+        Some(size) if size > MAX_CACHE_OBJECT_BYTES => ObjectSizeClass::Oversized,
+        Some(size) if size <= SMALL_CACHE_OBJECT_BYTES => ObjectSizeClass::Small,
+        Some(_) => ObjectSizeClass::Large,
+    }
+}
+
+fn content_length_size_class(content_length: Option<i64>) -> ObjectSizeClass {
+    match content_length {
+        None => ObjectSizeClass::Unknown,
+        Some(length) if length < 0 => ObjectSizeClass::Oversized,
+        Some(length) if length as u64 > MAX_CACHE_OBJECT_BYTES as u64 => ObjectSizeClass::Oversized,
+        Some(length) => object_size_class(Some(length as usize)),
+    }
+}
+
+fn sanitized_provider(provider: &str) -> Option<&'static str> {
+    match provider {
+        "firecrawl" => Some("firecrawl"),
+        "brave" => Some("brave"),
+        _ => None,
+    }
+}
+
+fn log_cache_outcome(
+    operation: CacheOperation,
+    provider: &str,
+    outcome: CacheOutcome,
+    object_size: ObjectSizeClass,
+    started: Instant,
+) {
+    let Some(provider) = sanitized_provider(provider) else {
+        return;
+    };
+    let operation = operation.as_str();
+    let cache_outcome = outcome.as_str();
+    let object_size_class = object_size.as_str();
+    let latency_ms = started.elapsed().as_millis() as u64;
+
+    match outcome {
+        CacheOutcome::Invalid | CacheOutcome::Unavailable | CacheOutcome::WriteFailed => {
+            tracing::warn!(
+                operation,
+                provider,
+                cache_outcome,
+                object_size_class,
+                latency_ms,
+                "cache operation failed"
+            );
+        }
+        CacheOutcome::Hit
+        | CacheOutcome::Missing
+        | CacheOutcome::Expired
+        | CacheOutcome::Stored => {
+            tracing::debug!(
+                operation,
+                provider,
+                cache_outcome,
+                object_size_class,
+                latency_ms,
+                "cache operation completed"
+            );
+        }
+    }
+}
+
+impl CacheStore {
+    pub(crate) fn new(config: &CacheConfig) -> Self {
+        let credentials = aws_sdk_s3::config::Credentials::new(
+            config.access_key_id().to_owned(),
+            config.secret_access_key().to_owned(),
+            None,
+            None,
+            "seshat-cache",
+        );
+        let s3_config = aws_sdk_s3::Config::builder()
+            .behavior_version_latest()
+            .region(aws_sdk_s3::config::Region::new(config.region().to_owned()))
+            .endpoint_url(config.endpoint().as_str())
+            .credentials_provider(credentials)
+            .force_path_style(true)
+            .retry_config(aws_sdk_s3::config::retry::RetryConfig::standard().with_max_attempts(1))
+            .build();
+
+        Self {
+            client: aws_sdk_s3::Client::from_conf(s3_config),
+            bucket: config.bucket().to_owned(),
+            search_ttl: config.search_ttl(),
+            scrape_ttl: config.scrape_ttl(),
+        }
+    }
+
+    pub(crate) async fn get<T>(
+        &self,
+        operation: CacheOperation,
+        provider: &str,
+        key: &str,
+    ) -> Option<T>
+    where
+        T: serde::de::DeserializeOwned,
+    {
+        let started = Instant::now();
+        if sanitized_provider(provider).is_none() {
+            log_cache_outcome(
+                operation,
+                provider,
+                CacheOutcome::Invalid,
+                ObjectSizeClass::Unknown,
+                started,
+            );
+            return None;
+        }
+
+        match tokio::time::timeout(CACHE_IO_TIMEOUT, self.read(operation, provider, key)).await {
+            Ok(Ok((payload, object_size))) => {
+                log_cache_outcome(operation, provider, CacheOutcome::Hit, object_size, started);
+                Some(payload)
+            }
+            Ok(Err((outcome, object_size))) => {
+                log_cache_outcome(operation, provider, outcome, object_size, started);
+                None
+            }
+            Err(_) => {
+                log_cache_outcome(
+                    operation,
+                    provider,
+                    CacheOutcome::Unavailable,
+                    ObjectSizeClass::Unknown,
+                    started,
+                );
+                None
+            }
+        }
+    }
+
+    async fn read<T>(
+        &self,
+        operation: CacheOperation,
+        provider: &str,
+        key: &str,
+    ) -> Result<(T, ObjectSizeClass), (CacheOutcome, ObjectSizeClass)>
+    where
+        T: serde::de::DeserializeOwned,
+    {
+        let output = match self
+            .client
+            .get_object()
+            .bucket(&self.bucket)
+            .key(key)
+            .send()
+            .await
+        {
+            Ok(output) => output,
+            Err(error) => {
+                let outcome = if is_missing_get_error(&error) {
+                    CacheOutcome::Missing
+                } else {
+                    CacheOutcome::Unavailable
+                };
+                return Err((outcome, ObjectSizeClass::Unknown));
+            }
+        };
+
+        let content_length = output.content_length;
+        let advertised_size = content_length_size_class(content_length);
+        let modified = match output.last_modified.as_ref() {
+            Some(value) => match SystemTime::try_from(*value) {
+                Ok(value) => value,
+                Err(_) => return Err((CacheOutcome::Invalid, advertised_size)),
+            },
+            None => return Err((CacheOutcome::Invalid, advertised_size)),
+        };
+
+        match cache_freshness(modified, SystemTime::now(), self.ttl(operation)) {
+            Freshness::Fresh => {}
+            Freshness::Expired => return Err((CacheOutcome::Expired, advertised_size)),
+            Freshness::Invalid => return Err((CacheOutcome::Invalid, advertised_size)),
+        }
+
+        if content_length
+            .is_some_and(|length| length < 0 || length as u64 > MAX_CACHE_OBJECT_BYTES as u64)
+        {
+            return Err((CacheOutcome::Invalid, ObjectSizeClass::Oversized));
+        }
+
+        let capacity = content_length
+            .map(|length| length as usize)
+            .unwrap_or_default();
+        let mut body = Vec::with_capacity(capacity);
+        let mut stream = output.body;
+        while let Some(chunk) = stream.try_next().await.map_err(|_| {
+            (
+                CacheOutcome::Unavailable,
+                object_size_class(Some(body.len())),
+            )
+        })? {
+            let next_len = body.len().saturating_add(chunk.len());
+            if next_len > MAX_CACHE_OBJECT_BYTES {
+                return Err((CacheOutcome::Invalid, ObjectSizeClass::Oversized));
+            }
+            body.extend_from_slice(&chunk);
+        }
+
+        let object_size = object_size_class(Some(body.len()));
+        let payload = decode_envelope(&body, operation, provider)
+            .map_err(|_| (CacheOutcome::Invalid, object_size))?;
+        Ok((payload, object_size))
+    }
+
+    pub(crate) async fn put<T>(
+        &self,
+        operation: CacheOperation,
+        provider: &str,
+        key: &str,
+        payload: &T,
+    ) where
+        T: serde::Serialize,
+    {
+        let started = Instant::now();
+        if sanitized_provider(provider).is_none() {
+            log_cache_outcome(
+                operation,
+                provider,
+                CacheOutcome::WriteFailed,
+                ObjectSizeClass::Unknown,
+                started,
+            );
+            return;
+        }
+
+        let body = match encode_envelope(operation, provider, payload) {
+            Ok(body) => body,
+            Err(_) => {
+                log_cache_outcome(
+                    operation,
+                    provider,
+                    CacheOutcome::WriteFailed,
+                    ObjectSizeClass::Unknown,
+                    started,
+                );
+                return;
+            }
+        };
+        let object_size = object_size_class(Some(body.len()));
+        if body.len() > MAX_CACHE_OBJECT_BYTES {
+            log_cache_outcome(
+                operation,
+                provider,
+                CacheOutcome::WriteFailed,
+                ObjectSizeClass::Oversized,
+                started,
+            );
+            return;
+        }
+
+        let result = tokio::time::timeout(
+            CACHE_IO_TIMEOUT,
+            self.client
+                .put_object()
+                .bucket(&self.bucket)
+                .key(key)
+                .content_type("application/json")
+                .body(aws_sdk_s3::primitives::ByteStream::from(body))
+                .send(),
+        )
+        .await;
+        let outcome = if matches!(result, Ok(Ok(_))) {
+            CacheOutcome::Stored
+        } else {
+            CacheOutcome::WriteFailed
+        };
+        log_cache_outcome(operation, provider, outcome, object_size, started);
+    }
+
+    fn ttl(&self, operation: CacheOperation) -> Duration {
+        match operation {
+            CacheOperation::Search => self.search_ttl,
+            CacheOperation::Scrape => self.scrape_ttl,
+        }
+    }
+}
+
+fn is_missing_get_error(
+    error: &aws_sdk_s3::error::SdkError<aws_sdk_s3::operation::get_object::GetObjectError>,
+) -> bool {
+    error
+        .as_service_error()
+        .is_some_and(|error| error.is_no_such_key())
+        || error
+            .raw_response()
+            .is_some_and(|response| response.status().as_u16() == 404)
 }
 
 #[cfg(test)]
@@ -280,6 +635,20 @@ mod tests {
         assert_eq!(
             cache_freshness(future, now, Duration::from_secs(10)),
             Freshness::Invalid
+        );
+    }
+
+    #[test]
+    fn object_size_classification_is_bounded_and_sanitized() {
+        assert_eq!(object_size_class(None), ObjectSizeClass::Unknown);
+        assert_eq!(object_size_class(Some(0)), ObjectSizeClass::Empty);
+        assert_eq!(
+            object_size_class(Some(MAX_CACHE_OBJECT_BYTES)),
+            ObjectSizeClass::Large
+        );
+        assert_eq!(
+            object_size_class(Some(MAX_CACHE_OBJECT_BYTES + 1)),
+            ObjectSizeClass::Oversized
         );
     }
 }
