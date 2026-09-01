@@ -12,6 +12,7 @@ use axum::{
 use serde::{Deserialize, Serialize};
 use url::Url;
 
+use crate::cache::{CacheOperation, CacheStore, scrape_cache_key, search_cache_key};
 use crate::config::{Config, SearchUpstream};
 use crate::error::ApiError;
 use crate::providers::brave::BraveProvider;
@@ -30,11 +31,13 @@ pub struct AppState {
     search_upstream: SearchUpstream,
     firecrawl: FirecrawlProvider,
     brave: Option<BraveProvider>,
+    cache: Option<CacheStore>,
     ready: bool,
 }
 
 impl AppState {
     pub fn new(config: Config, client: reqwest::Client) -> Self {
+        let cache = config.cache().map(CacheStore::new);
         let firecrawl = FirecrawlProvider::new(
             client.clone(),
             config.firecrawl_upstream_url().clone(),
@@ -48,6 +51,7 @@ impl AppState {
             search_upstream: config.search_upstream(),
             firecrawl,
             brave,
+            cache,
             ready: config.is_ready(),
         }
     }
@@ -94,6 +98,23 @@ async fn search(
     let request: SearchRequest =
         serde_json::from_slice(&body).map_err(|_| ApiError::InvalidInput)?;
     let input = normalize_search(request)?;
+    let provider = state.search_upstream.as_str();
+    let cache_key = search_cache_key(&input, provider);
+    if let Some(cache) = state.cache.as_ref()
+        && let Some(response) = cache
+            .get::<SearchResponse>(CacheOperation::Search, provider, &cache_key)
+            .await
+    {
+        if response.success {
+            return Ok(Json(response));
+        }
+        tracing::warn!(
+            operation = "search",
+            provider,
+            cache_outcome = "invalid",
+            "cache payload rejected"
+        );
+    }
     let response = tokio::time::timeout(REQUEST_TIMEOUT, async {
         match state.search_upstream {
             SearchUpstream::Firecrawl => state.firecrawl.search(&input).await,
@@ -109,6 +130,13 @@ async fn search(
     })
     .await
     .map_err(|_| ApiError::GatewayTimeout)??;
+    if response.success
+        && let Some(cache) = state.cache.as_ref()
+    {
+        cache
+            .put(CacheOperation::Search, provider, &cache_key, &response)
+            .await;
+    }
     Ok(Json(response))
 }
 
@@ -122,10 +150,34 @@ async fn scrape(
     let request: ScrapeRequest =
         serde_json::from_slice(&body).map_err(|_| ApiError::InvalidInput)?;
     let input = normalize_scrape(request).await?;
+    let provider = "firecrawl";
+    let cache_key = scrape_cache_key(&input, provider);
+    if let Some(cache) = state.cache.as_ref()
+        && let Some(response) = cache
+            .get::<ScrapeResponse>(CacheOperation::Scrape, provider, &cache_key)
+            .await
+    {
+        if response.success && validate_scrape_response(&response).await.is_ok() {
+            return Ok(Json(response));
+        }
+        tracing::warn!(
+            operation = "scrape",
+            provider,
+            cache_outcome = "invalid",
+            "cache payload rejected"
+        );
+    }
     let response = tokio::time::timeout(REQUEST_TIMEOUT, state.firecrawl.scrape(&input))
         .await
         .map_err(|_| ApiError::GatewayTimeout)??;
     validate_scrape_response(&response).await?;
+    if response.success
+        && let Some(cache) = state.cache.as_ref()
+    {
+        cache
+            .put(CacheOperation::Scrape, provider, &cache_key, &response)
+            .await;
+    }
     Ok(Json(response))
 }
 
@@ -303,9 +355,40 @@ fn is_forbidden_ipv6(address: Ipv6Addr) -> bool {
 
 #[cfg(test)]
 mod tests {
-    use super::{has_credential_query, is_forbidden_ip};
+    use super::{AppState, has_credential_query, is_forbidden_ip};
     use std::net::{IpAddr, Ipv4Addr, Ipv6Addr};
     use url::Url;
+
+    #[test]
+    fn enabled_cache_is_attached_without_affecting_readiness() {
+        let config = crate::config::Config::from_env_values(&std::collections::BTreeMap::from([
+            ("SESHAT_TOKEN".to_owned(), "auth".to_owned()),
+            ("FIRECRAWL_API_KEYS".to_owned(), "alpha".to_owned()),
+            ("SESHAT_CACHE_ENABLED".to_owned(), "true".to_owned()),
+            (
+                "SESHAT_CACHE_S3_ENDPOINT".to_owned(),
+                "http://127.0.0.1:1".to_owned(),
+            ),
+            (
+                "SESHAT_CACHE_S3_BUCKET".to_owned(),
+                "seshat-cache".to_owned(),
+            ),
+            ("SESHAT_CACHE_S3_REGION".to_owned(), "us-east-1".to_owned()),
+            (
+                "SESHAT_CACHE_S3_ACCESS_KEY_ID".to_owned(),
+                "access".to_owned(),
+            ),
+            (
+                "SESHAT_CACHE_S3_SECRET_ACCESS_KEY".to_owned(),
+                "secret".to_owned(),
+            ),
+        ]))
+        .expect("enabled cache config should load");
+
+        let state = AppState::new(config, reqwest::Client::new());
+        assert!(state.cache.is_some());
+        assert!(state.is_ready());
+    }
 
     #[test]
     fn rejects_private_loopback_metadata_and_mapped_ipv4_addresses() {
