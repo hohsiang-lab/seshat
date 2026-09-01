@@ -54,6 +54,7 @@ fn config(upstream: &str) -> Config {
         ("SESHAT_TOKEN".to_owned(), "auth".to_owned()),
         ("FIRECRAWL_API_KEYS".to_owned(), "alpha\nbeta".to_owned()),
         ("FIRECRAWL_UPSTREAM_URL".to_owned(), upstream.to_owned()),
+        ("SESHAT_CACHE_ENABLED".to_owned(), "false".to_owned()),
     ]))
     .expect("test config should load")
 }
