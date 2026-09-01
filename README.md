@@ -93,10 +93,11 @@ with externally supplied credentials.
 
 ## Container
 
-The Dockerfile builds a non-root runtime image. Pull requests run checks and a
-non-publishing build. The workflow publishes
-`ghcr.io/hohsiang-lab/seshat:latest` from `main` and records the resulting
-digest; pin that digest when reproducibility matters.
+The Dockerfile builds a non-root runtime image. Pull requests run checks only.
+Pushes to `main` build `linux/amd64` and `linux/arm64` on native runners in
+parallel, then merge the platform digests into
+`ghcr.io/hohsiang-lab/seshat:latest`; the workflow records the resulting
+digest for reproducible pinning.
 
 Kubernetes, Argo CD, GitOps, and cluster deployment are intentionally outside
 this repository's initial implementation.
