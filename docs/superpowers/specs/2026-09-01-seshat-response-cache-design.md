@@ -216,6 +216,10 @@ SESHAT_SEARCH_CACHE_TTL_SECS=600
 SESHAT_SCRAPE_CACHE_TTL_SECS=86400
 ```
 
+The endpoint, bucket, and region shown above are the current Monster deployment
+values, not application fallbacks. When caching is enabled, all RustFS settings
+must be supplied explicitly; only the two TTLs have application defaults.
+
 The endpoint and bucket are non-secret runtime configuration. Access and
 secret keys are injected from the deployment secret store. TTL values must be
 positive unsigned seconds; zero, non-numeric, and overflowing values are
@@ -240,7 +244,7 @@ The cache client uses only the S3 data-plane operations required by the route:
 - `PutObject` for successful validated provider responses.
 
 `HeadObject` is not required because `GetObject` supplies `Last-Modified` before
-the response body needs to be consumed. `ListObject`, `DeleteObject`, bucket
+the response body needs to be consumed. `ListObjects`, `DeleteObject`, bucket
 administration, and anonymous access are not part of the application path.
 
 The deployment must provision:
@@ -368,9 +372,9 @@ not appear in command arguments, shell history, output, fixtures, or reports.
 
 1. Add validated cache configuration and TTL defaults while preserving the
    current behavior when caching is disabled.
-2. Add the concrete S3-backed `CacheStore` with bounded object reads/writes and
+2. Add deterministic key generation and envelope validation.
+3. Add the concrete S3-backed `CacheStore` with bounded object reads/writes and
    fail-open error handling.
-3. Add deterministic key generation and envelope validation.
 4. Integrate cache-aside flow into `search` and `scrape` after existing request
    validation and before provider calls.
 5. Add sanitized cache outcome logging and document runtime configuration.

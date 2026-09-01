@@ -1,6 +1,6 @@
 # Seshat RustFS Response Cache Implementation Plan
 
-> **For agentic workers:** REQUIRED SUB-SKILL: Use superpowers:subagent-driven-development (recommended) or superpowers:executing-plans to implement this plan task-by-task. Steps use checkbox (`- [ ]`) syntax for tracking.
+> **For Hermes workers:** Use a fresh `delegate_task` per implementation task with strict TDD. After each task, verify its exact diff and listed checks before starting the next task. Steps use checkbox (`- [ ]`) syntax for tracking.
 
 **Goal:** Add an opt-in, shared RustFS response cache to Seshat `/v2/search` and `/v2/scrape` without changing the existing Firecrawl-compatible API or validation boundaries.
 
@@ -22,6 +22,7 @@
 - Cache only validated successful responses. Never cache authentication failures, caller errors, provider errors, malformed responses, arbitrary headers, or credentials.
 - Cache keys use deterministic secret-free JSON and SHA-256 under `cache/v1`; raw queries, URLs, bearer tokens, upstream keys, and caller headers never become keys, metadata, logs, or metrics.
 - RustFS is used only through its S3 data plane with runtime-injected endpoint, region, access key, and secret key; application code uses only `GetObject` and `PutObject`.
+- When enabled, endpoint, bucket, region, and both credentials are required explicitly; only search/scrape TTLs have application defaults.
 - Object reads are bounded by `MAX_UPSTREAM_BODY_BYTES`; no unbounded `ByteStream::collect()` is permitted.
 - Extend existing Rust/unit and contract tests; do not add a committed test file for RustFS. Use a disposable RustFS bucket and counting mock upstream for the manual integration matrix.
 - The RustFS bucket, dedicated identity, prefix policy, ExternalSecret wiring, and lifecycle rule belong to a separate `dev-infra` change and must not be added to this Seshat repository plan.
@@ -32,8 +33,8 @@
 
 ### Modify
 
-- `Cargo.toml` — add the AWS S3 SDK and direct hashing/encoding dependencies.
-- `Cargo.lock` — record the locked dependency graph with Cargo.
+- `Cargo.toml` — add `hex`/`sha2` with key generation and `aws-sdk-s3` with the concrete store; keep additions scoped to the task that first uses each dependency.
+- `Cargo.lock` — record only those direct dependency additions and their required transitive graph.
 - `src/lib.rs` — expose the new `cache` module.
 - `src/config.rs` — parse opt-in cache settings, TTLs, RustFS endpoint, bucket, region, and secret-backed credentials; keep secrets out of `Debug`.
 - `src/routes.rs` — attach an optional `CacheStore` to `AppState` and add cache-aside behavior to search and scrape after existing validation.
@@ -59,8 +60,6 @@
 
 **Files:**
 
-- Modify: `Cargo.toml`
-- Modify: `Cargo.lock`
 - Modify: `src/config.rs`
 - Modify: `tests/config_contract.rs`
 
@@ -69,19 +68,7 @@
 - Consumes: existing `BTreeMap<String, String>` input used by `Config::from_env_values`.
 - Produces: `pub struct CacheConfig`, `Config::cache() -> Option<&CacheConfig>`, `CacheConfig::endpoint() -> &Url`, `CacheConfig::bucket() -> &str`, `CacheConfig::region() -> &str`, `CacheConfig::search_ttl() -> Duration`, `CacheConfig::scrape_ttl() -> Duration`, and crate-visible credential accessors used only by `CacheStore`.
 
-- [ ] **Step 1: Add only the required dependencies**
-
-Add these direct dependencies to `Cargo.toml`; keep the existing Tokio/Rustls stack and do not add `aws-config` because the generated S3 config builder can be constructed synchronously with explicit credentials.
-
-```toml
-aws-sdk-s3 = { version = "1", features = ["behavior-version-latest"] }
-hex = "0.4"
-sha2 = "0.11"
-```
-
-Run `cargo check` to resolve `Cargo.lock`. Confirm the lockfile changes contain the SDK and its transitive graph only, with no unrelated dependency upgrades.
-
-- [ ] **Step 2: Write the failing configuration contract tests**
+- [ ] **Step 1: Write the failing configuration contract tests**
 
 Append tests to the existing `tests/config_contract.rs` using the file's current `vars` helper. The credential strings below are synthetic test sentinels, not deployment values.
 
@@ -157,7 +144,9 @@ cargo test --test config_contract cache -- --nocapture
 
 Expected: FAIL because `CacheConfig`, `Config::cache`, and the cache fields do not exist yet.
 
-- [ ] **Step 3: Implement `CacheConfig` and parsing**
+Extend the focused tests with one default-TTL case (enabled cache without TTL variables yields `600` and `86400` seconds) and table-driven invalid cases for the boolean flag, each required RustFS field, endpoint/bucket validation, zero/non-numeric/overflowing search and scrape TTLs. Assert the stable configuration code and that no supplied secret or raw invalid value is echoed.
+
+- [ ] **Step 2: Implement `CacheConfig` and parsing**
 
 In `src/config.rs`:
 
@@ -181,7 +170,7 @@ In `src/config.rs`:
 
 Use the existing `ConfigError::Invalid` variant so no public error schema changes.
 
-- [ ] **Step 4: Run the focused configuration tests**
+- [ ] **Step 3: Run the focused configuration tests**
 
 ```bash
 cargo fmt --check
@@ -191,10 +180,10 @@ cargo test --test config_contract
 
 Expected: PASS, with no synthetic credential sentinel present in formatted configuration diagnostics.
 
-- [ ] **Step 5: Commit the configuration slice**
+- [ ] **Step 4: Commit the configuration slice**
 
 ```bash
-git add Cargo.toml Cargo.lock src/config.rs tests/config_contract.rs
+git add src/config.rs tests/config_contract.rs
 git commit -m "feat: add opt-in response cache configuration"
 ```
 
@@ -206,15 +195,17 @@ git commit -m "feat: add opt-in response cache configuration"
 
 - Create: `src/cache.rs`
 - Modify: `src/lib.rs`
+- Modify: `Cargo.toml`
+- Modify: `Cargo.lock`
 
 **Interfaces:**
 
 - Consumes: `SearchInput`, `ScrapeInput`, `SearchResponse`, `ScrapeResponse`, and provider identifiers from `SearchUpstream::as_str()`.
-- Produces: crate-visible `CacheOperation`, `CacheMissReason`, `CacheLookup<T>`, `search_cache_key`, `scrape_cache_key`, `encode_envelope`, `decode_envelope`, and `cache_freshness` for the S3 implementation and routes.
+- Produces: crate-visible `CacheOperation`, `search_cache_key`, `scrape_cache_key`, `encode_envelope`, `decode_envelope`, and `cache_freshness` for the S3 implementation and routes; cache lookup uses standard `Option<T>`.
 
-- [ ] **Step 1: Add failing pure unit tests inside the new module**
+- [ ] **Step 1: Add hashing dependencies and failing pure unit tests**
 
-Create `src/cache.rs` with a test module first. The tests must not construct an S3 client or make a network call.
+Add only `hex = "0.4"` and `sha2 = "0.11"` to `Cargo.toml`, add `pub mod cache;` to `src/lib.rs`, resolve `Cargo.lock`, then create `src/cache.rs` with a test module. Run the test target and confirm it fails because the referenced cache functions are not implemented yet; do not accept a “0 tests” result. The tests must not construct an S3 client or make a network call.
 
 ```rust
 #[cfg(test)]
@@ -320,9 +311,11 @@ cargo test cache::tests -- --nocapture
 
 Expected: FAIL because the module and pure functions do not exist.
 
+Before implementing, extend the envelope test with malformed JSON and independent wrong-operation and wrong-provider mutations; each must fail closed. Keep the test pure and network-free.
+
 - [ ] **Step 2: Implement canonical key functions**
 
-Add `pub mod cache;` to `src/lib.rs`. In `src/cache.rs`, define:
+In `src/cache.rs`, define:
 
 ```rust
 pub(crate) const CACHE_VERSION: u8 = 1;
@@ -349,19 +342,6 @@ pub(crate) enum Freshness {
     Invalid,
 }
 
-#[derive(Clone, Copy, Debug, PartialEq, Eq)]
-pub(crate) enum CacheMissReason {
-    Missing,
-    Expired,
-    Invalid,
-    Unavailable,
-}
-
-#[derive(Debug)]
-pub(crate) enum CacheLookup<T> {
-    Hit(T),
-    Miss(CacheMissReason),
-}
 ```
 
 Use fixed-order Serde structs for canonical input. Search fields are `cache_version`, `operation`, `provider`, `query`, and `limit`. Scrape fields are `cache_version`, `operation`, `provider`, `url`, and `formats`. Serialize with `serde_json::to_vec`, hash with `sha2::Sha256`, hex encode with `hex::encode`, and return exactly:
@@ -416,7 +396,7 @@ Expected: PASS, including deterministic provider-aware keys, order-independent s
 - [ ] **Step 5: Commit the pure cache slice**
 
 ```bash
-git add src/lib.rs src/cache.rs
+git add Cargo.toml Cargo.lock src/lib.rs src/cache.rs
 git commit -m "feat: add response cache keys and envelopes"
 ```
 
@@ -427,13 +407,17 @@ git commit -m "feat: add response cache keys and envelopes"
 **Files:**
 
 - Modify: `src/cache.rs`
+- Modify: `Cargo.toml`
+- Modify: `Cargo.lock`
 
 **Interfaces:**
 
 - Consumes: `CacheConfig`, `CacheOperation`, `encode_envelope`, `decode_envelope`, and `cache_freshness`.
-- Produces: `CacheStore::new(&CacheConfig) -> CacheStore`, `CacheStore::get<T>(&self, CacheOperation, &str, &str) -> CacheLookup<T>`, and `CacheStore::put<T>(&self, CacheOperation, &str, &str, &T)`.
+- Produces: `CacheStore::new(&CacheConfig) -> CacheStore`, `CacheStore::get<T>(&self, CacheOperation, &str, &str) -> Option<T>`, and `CacheStore::put<T>(&self, CacheOperation, &str, &str, &T)`.
 
-- [ ] **Step 1: Construct the S3 client with explicit RustFS settings**
+- [ ] **Step 1: Add the S3 SDK and construct the client with explicit RustFS settings**
+
+Add `aws-sdk-s3 = { version = "1", features = ["behavior-version-latest"] }` and resolve `Cargo.lock`. Do not add `aws-config`; the generated S3 config builder is constructed synchronously with explicit credentials.
 
 Add these fields to `CacheStore`:
 
@@ -482,7 +466,7 @@ pub(crate) async fn get<T>(
     operation: CacheOperation,
     provider: &str,
     key: &str,
-) -> CacheLookup<T>
+) -> Option<T>
 where
     T: serde::de::DeserializeOwned,
 ```
@@ -490,13 +474,13 @@ where
 Wrap the entire `GetObject` request and body stream in `tokio::time::timeout(CACHE_IO_TIMEOUT, ...)`. The read sequence is:
 
 1. call `self.client.get_object().bucket(&self.bucket).key(key).send()`;
-2. classify `NoSuchKey` or HTTP 404 as `CacheMissReason::Missing`; classify all other SDK, timeout, and transport failures as `Unavailable` without logging the raw SDK error;
+2. classify `NoSuchKey` or HTTP 404 as a missing result; classify all other SDK, timeout, and transport failures as unavailable without logging the raw SDK error;
 3. require `output.last_modified`; convert the SDK `DateTime` with `SystemTime::try_from`; missing or conversion failure is `Invalid`;
 4. compare `Last-Modified` to `SystemTime::now()` using `cache_freshness` and the current TTL for `operation`; future is `Invalid`, age at/above TTL is `Expired`; return before consuming the body for an expired object;
 5. reject negative or over-limit `content_length` values;
 6. consume `output.body` with the SDK's bounded `try_next()` loop, checking `body.len().saturating_add(chunk.len())` before every append; stop with `Invalid` when the cap would be exceeded and `Unavailable` on stream failure;
 7. call `decode_envelope` with the expected operation and provider; malformed, wrong-version, wrong-operation, wrong-provider, or wrong-payload JSON is `Invalid`;
-8. return `CacheLookup::Hit(payload)` only after all checks pass.
+8. return `Some(payload)` only after all checks pass; return `None` for every miss, invalid object, or unavailable cache outcome.
 
 The cache module must never log the object key, body, URL, query, credential, authorization header, or SDK error text.
 
@@ -553,12 +537,12 @@ cargo check --all-targets
 cargo test cache::tests -- --nocapture
 ```
 
-Expected: PASS. Inspect source and `cargo tree` to confirm the direct dependency is `aws-sdk-s3` and that no cache implementation uses unbounded body collection.
+Expected: PASS. Inspect source and `cargo tree` to confirm `aws-sdk-s3` is the only new storage dependency and that no cache implementation uses unbounded body collection.
 
 - [ ] **Step 6: Commit the S3 cache slice**
 
 ```bash
-git add src/cache.rs Cargo.lock
+git add src/cache.rs Cargo.toml Cargo.lock
 git commit -m "feat: add RustFS-backed response cache store"
 ```
 
@@ -573,7 +557,7 @@ git commit -m "feat: add RustFS-backed response cache store"
 
 **Interfaces:**
 
-- Consumes: `CacheStore`, `CacheLookup`, `CacheOperation`, `search_cache_key`, `scrape_cache_key`, `SearchUpstream::as_str`, and the existing provider/response validators.
+- Consumes: `CacheStore`, `CacheOperation`, `search_cache_key`, `scrape_cache_key`, `SearchUpstream::as_str`, and the existing provider/response validators.
 - Produces: `AppState { cache: Option<CacheStore> }` while keeping the public HTTP routes and response JSON unchanged.
 
 - [ ] **Step 1: Make the existing HTTP baseline explicit about disabled cache**
@@ -612,15 +596,14 @@ In `search`, retain the current order through `require_auth`, body decode, and `
 let provider = state.search_upstream.as_str();
 let cache_key = search_cache_key(&input, provider);
 if let Some(cache) = state.cache.as_ref() {
-    match cache
+    if let Some(response) = cache
         .get::<SearchResponse>(CacheOperation::Search, provider, &cache_key)
         .await
     {
-        CacheLookup::Hit(response) if response.success => return Ok(Json(response)),
-        CacheLookup::Hit(_) => {
-            tracing::warn!(operation = "search", provider, cache_outcome = "invalid", "cache payload rejected");
+        if response.success {
+            return Ok(Json(response));
         }
-        CacheLookup::Miss(_) => {}
+        tracing::warn!(operation = "search", provider, cache_outcome = "invalid", "cache payload rejected");
     }
 }
 ```
@@ -635,19 +618,14 @@ In `scrape`, retain auth, JSON parsing, `normalize_scrape`, DNS/private-address 
 let provider = "firecrawl";
 let cache_key = scrape_cache_key(&input, provider);
 if let Some(cache) = state.cache.as_ref() {
-    match cache
+    if let Some(response) = cache
         .get::<ScrapeResponse>(CacheOperation::Scrape, provider, &cache_key)
         .await
     {
-        CacheLookup::Hit(response)
-            if response.success && validate_scrape_response(&response).await.is_ok() =>
-        {
+        if response.success && validate_scrape_response(&response).await.is_ok() {
             return Ok(Json(response));
         }
-        CacheLookup::Hit(_) => {
-            tracing::warn!(operation = "scrape", provider, cache_outcome = "invalid", "cache payload rejected");
-        }
-        CacheLookup::Miss(_) => {}
+        tracing::warn!(operation = "scrape", provider, cache_outcome = "invalid", "cache payload rejected");
     }
 }
 ```
@@ -702,6 +680,7 @@ SESHAT_SCRAPE_CACHE_TTL_SECS=86400
 ```
 
 List `SESHAT_CACHE_S3_ACCESS_KEY_ID` and `SESHAT_CACHE_S3_SECRET_ACCESS_KEY` by name as secret-manager-injected values, without sample values. State that enabled mode requires all RustFS settings and that TTLs must be positive unsigned seconds.
+Clarify that the endpoint, bucket, and region shown above are the current Monster deployment values, not parser fallbacks; enabled mode requires them explicitly, while only the two TTLs default in application code.
 
 - [ ] **Step 2: Document behavior and rollback**
 
@@ -714,6 +693,7 @@ State that:
 - expired content is not a stale fallback;
 - duplicate concurrent misses are allowed;
 - the cache key is opaque under `cache/v1` and provider-aware;
+- lifecycle is storage cleanup only; if an operation TTL is configured beyond seven days, update the lifecycle retention in the same deployment change;
 - disabling `SESHAT_CACHE_ENABLED` returns Seshat to the current direct-provider path and leaves old objects for lifecycle cleanup.
 
 - [ ] **Step 3: Record the external deployment boundary**
@@ -725,6 +705,7 @@ Add a short operator note that this repository does not create buckets or creden
 - `GetObject` and `PutObject` only under `cache/v1/`;
 - secret-backed injection of the two cache credential environment variables;
 - a seven-day lifecycle rule for `cache/v1/`;
+- an unversioned bucket, or matching noncurrent-version expiration when bucket versioning is enabled;
 - the current Monster endpoint `http://rustfs.rustfs.svc.cluster.local:9000`, region `us-east-1`, and path-style addressing.
 
 Explicitly state that cache remains disabled until the separate deployment change has passed bucket, policy, secret metadata, and lifecycle readback. Do not document Vault property names until the approved deployment contract supplies them.
@@ -743,16 +724,11 @@ The README review must contain no credential values, bearer headers, access-key 
 
 ## Task 6: Run repository checks and the disposable RustFS smoke matrix
 
-**Files:** none committed by this task; use disposable local processes/files only.
+**Files:** none committed by this task; use only disposable local processes/files and an explicitly approved disposable RustFS bucket.
 
-**Interfaces:**
+**Boundary:** This is verification, not deployment. Keep credentials in injected process environment/memory; never put them in command arguments, fixtures, repository files, logs, or reports. If the approved RustFS endpoint or secret injection is unavailable, record those RustFS cases as `UNVERIFIED` rather than substituting a guessed pass.
 
-- Consumes: the cache-enabled Seshat binary, a counting Firecrawl-compatible mock, a disposable RustFS bucket, and secret-manager-injected runtime variables.
-- Produces: separate local-test, cache-behavior, RustFS data-plane, and lifecycle evidence. Do not collapse them into one success claim.
-
-- [ ] **Step 1: Run the repository-native gates**
-
-From a clean Seshat worktree:
+- [ ] **Step 1: Run repository-native gates from a clean worktree**
 
 ```bash
 git status --short --branch
@@ -764,88 +740,27 @@ python -m pytest tests -q
 docker build --pull=false --tag seshat:cache-check .
 ```
 
-Expected: the worktree is clean before the smoke run, all Rust/Python checks pass, and the non-root image builds with `cargo build --release --locked`.
+Confirm the image uses the existing non-root release flow and that no unrelated files are dirty.
 
-- [ ] **Step 2: Start a counting Firecrawl-compatible mock without credentials**
+- [ ] **Step 2: Execute the required cache matrix**
 
-Use a disposable standard-library Python process outside the repository. It must:
+Run a loopback-only counting Firecrawl-compatible mock outside the repository and a private disposable RustFS bucket through the approved admin path. Read back the lifecycle configuration before cleanup. Verify, as separate evidence:
 
-- bind only to `127.0.0.1` on an ephemeral port;
-- accept `POST /v2/search` and `POST /v2/scrape`;
-- increment an in-memory counter for each provider request;
-- return the existing successful Firecrawl-compatible JSON fixtures used by `tests/firecrawl_compat_contract.rs`;
-- expose `GET /calls` returning only the integer counter;
-- suppress request-body and header logging.
+1. disabled-cache direct-provider baseline;
+2. authenticated search/scrape miss → one provider call → one object, then fresh hit → no additional call;
+3. query, limit, URL, format-set, provider, and cache-version key separation;
+4. reverse-order scrape formats, process restart, and second-instance sharing;
+5. one-second current-TTL expiry and changed-TTL readback without rewriting;
+6. missing/future `Last-Modified`, malformed/wrong-version/wrong-operation/wrong-provider/oversized objects → provider fallback;
+7. RustFS read/write failure, provider caller/error/timeout/malformed responses, and expired-object-plus-provider-failure → existing API behavior with no stale fallback or error write;
+8. auth/SSRF/response validation before cache access and sanitized logs without secrets, raw requests, object keys, bodies, or SDK error text;
+9. path-style, SigV4, bounded `GetObject`, prefix-only runtime permission, and enabled seven-day `cache/v1/` lifecycle readback.
 
-Point `FIRECRAWL_UPSTREAM_URL` at this mock in the Seshat process. Supply `SESHAT_TOKEN`, the Firecrawl provider key source, and RustFS cache credentials from the existing secret manager or process environment; do not place values in command arguments, files committed to Git, or captured output.
+Use only the existing successful compatibility fixtures for the mock response. Stop processes and remove only the disposable bucket/prefix after evidence capture; lifecycle deletion is asynchronous.
 
-- [ ] **Step 3: Provision a disposable private RustFS bucket with the admin path**
+- [ ] **Step 3: Record separate evidence**
 
-Using the approved RustFS administration identity in a shell where its credentials are already injected, create or select a disposable bucket and configure this lifecycle JSON in a temporary file:
-
-```json
-{
-  "Rules": [
-    {
-      "ID": "seshat-cache-seven-day",
-      "Status": "Enabled",
-      "Filter": { "Prefix": "cache/v1/" },
-      "Expiration": { "Days": 7 }
-    }
-  ]
-}
-```
-
-Use the S3-compatible CLI against the configured endpoint for bucket setup and lifecycle readback. The Seshat runtime identity must have only object GET/PUT access under `cache/v1/`; bucket creation and lifecycle administration must not be available to it.
-
-- [ ] **Step 4: Verify cache miss, hit, key separation, and restart sharing**
-
-With cache enabled and the counting mock running:
-
-1. Call an authenticated search request once; expect provider counter `1` and one `cache/v1/search/...json` object.
-2. Repeat the same normalized search request; expect the same response and provider counter still `1`.
-3. Change query and limit independently; expect provider calls and distinct opaque keys.
-4. Call an authenticated scrape request once; repeat it with formats in reverse order; expect one provider call for the semantic format set and one `cache/v1/scrape/...json` object.
-5. Start a second Seshat process with the same cache configuration; repeat a fresh request and expect a cache hit without increasing the mock counter.
-6. Confirm missing/invalid bearer tokens and unsafe scrape URLs are rejected before any cache or mock-provider call.
-
-The HTTP client used for the smoke run must read the bearer token from process memory/environment and print only status, response shape, and mock counter; it must not place the token in an argument or log.
-
-- [ ] **Step 5: Verify current-TTL expiry and invalid-object fallback**
-
-Restart Seshat with a disposable positive one-second search TTL. Confirm a cached object is a hit immediately, then wait longer than one second and confirm the next request calls the provider while the old object may still exist in RustFS. Change the configured TTL without rewriting the object and confirm the new current TTL controls freshness.
-
-Use the admin S3 path to exercise these fallbacks with the exact derived opaque key: missing `Last-Modified`, future `Last-Modified`, wrong envelope version, wrong operation/provider, malformed JSON, and an object larger than `MAX_CACHE_OBJECT_BYTES`. Each case must call the provider rather than return stored data.
-
-- [ ] **Step 6: Verify fail-open and no-write-on-error behavior**
-
-Run separate smoke cases for:
-
-- RustFS connection timeout or unavailable endpoint while the mock provider succeeds: the API response remains provider success and logs only a sanitized cache outcome;
-- RustFS write permission/5xx failure after a provider success: the API response remains provider success;
-- provider `400`/`422`, retry exhaustion, timeout, and malformed response: the API preserves the existing error contract and no object is written;
-- expired object plus provider failure: the API returns the provider failure, not stale content.
-
-Review captured logs for operation/provider/outcome/timing fields and assert that no bearer value, upstream key, raw query, URL, object key, body, authorization header, or SDK error text appears.
-
-- [ ] **Step 7: Verify lifecycle metadata and clean up disposable resources**
-
-Read back the lifecycle configuration and assert the enabled `cache/v1/` rule has seven-day expiration. Treat deletion as asynchronous; do not require an exact deletion timestamp. Remove only the disposable bucket/prefix and stop the mock/Seshat processes after evidence is captured. Leave no credentials, temporary request bodies, or cache objects in the repository or command history.
-
-- [ ] **Step 8: Record separate final evidence**
-
-Record:
-
-- exact Seshat commit and clean worktree state;
-- local format, clippy, Rust test, Python test, and image-build results;
-- cache-disabled regression result;
-- RustFS `GetObject`/`PutObject`, path-style, SigV4, and bounded-read result;
-- search and scrape hit/miss/expiry/fail-open results;
-- authentication/SSRF/response-validation result;
-- lifecycle configuration readback;
-- any unavailable live deployment/provider gate as `UNVERIFIED`, never as a guessed pass.
-
-No deployment rollout or external write is part of this Seshat plan.
+Record the exact commit and clean status, each local gate result, cache-disabled regression, cache behavior matrix, RustFS data-plane/permission/lifecycle readbacks, and every unavailable live gate as `UNVERIFIED`. No deployment rollout is part of this plan.
 
 ---
 
@@ -861,4 +776,4 @@ Set `SESHAT_CACHE_ENABLED=false` and remove cache runtime settings from the work
 
 - **Spec coverage:** Tasks 1–2 cover configuration, deterministic keys, envelope validation, and current-TTL freshness. Task 3 covers bounded RustFS data-plane access, timeouts, fail-open writes, and sanitized logs. Task 4 covers both routes, auth/validation ordering, response validation, and no stale fallback. Task 5 covers runtime documentation and rollback. Task 6 covers the required local, RustFS, mock-provider, expiry, failure, restart, lifecycle, and secret-safety checks. The separate deployment boundary covers the bucket, dedicated identity, prefix policy, ExternalSecret, and lifecycle handoff without crossing repositories.
 - **Completeness scan:** no incomplete implementation marker or unfinished configuration value is used in the plan. Runtime secrets are explicitly supplied out-of-band and never represented as literals.
-- **Type consistency:** `CacheOperation`, `CacheLookup<T>`, `CacheStore::get`, `CacheStore::put`, `search_cache_key`, `scrape_cache_key`, and `CacheConfig` are defined before later tasks consume them. `SearchResponse` and `ScrapeResponse` retain their existing provider module types.
+- **Type consistency:** `CacheOperation`, `CacheStore::get`, `CacheStore::put`, `search_cache_key`, `scrape_cache_key`, and `CacheConfig` are defined before later tasks consume them; lookup uses standard `Option<T>`. `SearchResponse` and `ScrapeResponse` retain their existing provider module types.
