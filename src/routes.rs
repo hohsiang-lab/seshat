@@ -100,21 +100,20 @@ async fn search(
     let input = normalize_search(request)?;
     let provider = state.search_upstream.as_str();
     let cache_key = search_cache_key(&input, provider);
-    if let Some(cache) = state.cache.as_ref() {
-        if let Some(response) = cache
+    if let Some(cache) = state.cache.as_ref()
+        && let Some(response) = cache
             .get::<SearchResponse>(CacheOperation::Search, provider, &cache_key)
             .await
-        {
-            if response.success {
-                return Ok(Json(response));
-            }
-            tracing::warn!(
-                operation = "search",
-                provider,
-                cache_outcome = "invalid",
-                "cache payload rejected"
-            );
+    {
+        if response.success {
+            return Ok(Json(response));
         }
+        tracing::warn!(
+            operation = "search",
+            provider,
+            cache_outcome = "invalid",
+            "cache payload rejected"
+        );
     }
     let response = tokio::time::timeout(REQUEST_TIMEOUT, async {
         match state.search_upstream {
@@ -131,12 +130,12 @@ async fn search(
     })
     .await
     .map_err(|_| ApiError::GatewayTimeout)??;
-    if response.success {
-        if let Some(cache) = state.cache.as_ref() {
-            cache
-                .put(CacheOperation::Search, provider, &cache_key, &response)
-                .await;
-        }
+    if response.success
+        && let Some(cache) = state.cache.as_ref()
+    {
+        cache
+            .put(CacheOperation::Search, provider, &cache_key, &response)
+            .await;
     }
     Ok(Json(response))
 }
@@ -153,32 +152,31 @@ async fn scrape(
     let input = normalize_scrape(request).await?;
     let provider = "firecrawl";
     let cache_key = scrape_cache_key(&input, provider);
-    if let Some(cache) = state.cache.as_ref() {
-        if let Some(response) = cache
+    if let Some(cache) = state.cache.as_ref()
+        && let Some(response) = cache
             .get::<ScrapeResponse>(CacheOperation::Scrape, provider, &cache_key)
             .await
-        {
-            if response.success && validate_scrape_response(&response).await.is_ok() {
-                return Ok(Json(response));
-            }
-            tracing::warn!(
-                operation = "scrape",
-                provider,
-                cache_outcome = "invalid",
-                "cache payload rejected"
-            );
+    {
+        if response.success && validate_scrape_response(&response).await.is_ok() {
+            return Ok(Json(response));
         }
+        tracing::warn!(
+            operation = "scrape",
+            provider,
+            cache_outcome = "invalid",
+            "cache payload rejected"
+        );
     }
     let response = tokio::time::timeout(REQUEST_TIMEOUT, state.firecrawl.scrape(&input))
         .await
         .map_err(|_| ApiError::GatewayTimeout)??;
     validate_scrape_response(&response).await?;
-    if response.success {
-        if let Some(cache) = state.cache.as_ref() {
-            cache
-                .put(CacheOperation::Scrape, provider, &cache_key, &response)
-                .await;
-        }
+    if response.success
+        && let Some(cache) = state.cache.as_ref()
+    {
+        cache
+            .put(CacheOperation::Scrape, provider, &cache_key, &response)
+            .await;
     }
     Ok(Json(response))
 }
