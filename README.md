@@ -94,10 +94,9 @@ with externally supplied credentials.
 ## Container
 
 The Dockerfile builds a non-root runtime image. Pull requests run checks and a
-non-publishing build. The workflow's `main` publish path is configured for the
-provisional package `ghcr.io/hohsiang-lab/seshat`; confirm the GitHub owner and
-package name before creating a remote repository or publishing. Published tags
-are commit SHA tags only, and the workflow records the resulting digest.
+non-publishing build. The workflow publishes
+`ghcr.io/hohsiang-lab/seshat:latest` from `main` and records the resulting
+digest; pin that digest when reproducibility matters.
 
 Kubernetes, Argo CD, GitOps, and cluster deployment are intentionally outside
 this repository's initial implementation.
