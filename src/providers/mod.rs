@@ -1,5 +1,6 @@
 pub mod brave;
 pub mod firecrawl;
+pub mod tavily;
 
 use std::collections::BTreeMap;
 use std::time::Instant;
