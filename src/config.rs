@@ -11,6 +11,7 @@ use crate::key_pool::KeyPool;
 
 const DEFAULT_FIRECRAWL_URL: &str = "https://api.firecrawl.dev";
 const DEFAULT_BRAVE_URL: &str = "https://api.search.brave.com";
+const DEFAULT_TAVILY_URL: &str = "https://api.tavily.com";
 const DEFAULT_BIND_ADDR: &str = "0.0.0.0:8080";
 const DEFAULT_SEARCH_CACHE_TTL_SECS: u64 = 600;
 const DEFAULT_SCRAPE_CACHE_TTL_SECS: u64 = 86_400;
@@ -19,6 +20,7 @@ const DEFAULT_SCRAPE_CACHE_TTL_SECS: u64 = 86_400;
 pub enum SearchUpstream {
     Firecrawl,
     Brave,
+    Tavily,
 }
 
 impl SearchUpstream {
@@ -26,6 +28,7 @@ impl SearchUpstream {
         match self {
             Self::Firecrawl => "firecrawl",
             Self::Brave => "brave",
+            Self::Tavily => "tavily",
         }
     }
 }
@@ -37,6 +40,7 @@ impl FromStr for SearchUpstream {
         match value {
             "firecrawl" => Ok(Self::Firecrawl),
             "brave" => Ok(Self::Brave),
+            "tavily" => Ok(Self::Tavily),
             _ => Err(ConfigError::Invalid),
         }
     }
@@ -108,9 +112,11 @@ pub struct Config {
     search_upstream: SearchUpstream,
     firecrawl_upstream_url: Url,
     brave_upstream_url: Url,
+    tavily_upstream_url: Url,
     bind_addr: SocketAddr,
     firecrawl_keys: KeyPool,
     brave_keys: Option<KeyPool>,
+    tavily_keys: Option<KeyPool>,
     cache: Option<CacheConfig>,
 }
 
@@ -122,9 +128,11 @@ impl fmt::Debug for Config {
             .field("search_upstream", &self.search_upstream)
             .field("firecrawl_upstream_url", &self.firecrawl_upstream_url)
             .field("brave_upstream_url", &self.brave_upstream_url)
+            .field("tavily_upstream_url", &self.tavily_upstream_url)
             .field("bind_addr", &self.bind_addr)
             .field("firecrawl_keys", &self.firecrawl_keys)
             .field("brave_keys", &self.brave_keys)
+            .field("tavily_keys", &self.tavily_keys)
             .field("cache", &self.cache)
             .finish()
     }
@@ -156,6 +164,11 @@ impl Config {
                 .map(String::as_str)
                 .unwrap_or(DEFAULT_BRAVE_URL),
         )?;
+        let tavily_upstream_url = parse_base_url(
+            vars.get("TAVILY_SEARCH_UPSTREAM_URL")
+                .map(String::as_str)
+                .unwrap_or(DEFAULT_TAVILY_URL),
+        )?;
         let bind_addr = vars
             .get("SESHAT_BIND_ADDR")
             .map(String::as_str)
@@ -174,6 +187,15 @@ impl Config {
                 vars.get("BRAVE_SEARCH_API_KEYS").map(String::as_str),
                 "brave",
             )?),
+            SearchUpstream::Tavily => None,
+        };
+        let tavily_keys = match search_upstream {
+            SearchUpstream::Firecrawl | SearchUpstream::Brave => None,
+            SearchUpstream::Tavily => Some(KeyPool::from_file_or_env(
+                vars.get("TAVILY_SEARCH_API_KEYS_FILE").map(String::as_str),
+                vars.get("TAVILY_SEARCH_API_KEYS").map(String::as_str),
+                "tavily",
+            )?),
         };
         let cache = parse_cache_config(vars)?;
 
@@ -182,9 +204,11 @@ impl Config {
             search_upstream,
             firecrawl_upstream_url,
             brave_upstream_url,
+            tavily_upstream_url,
             bind_addr,
             firecrawl_keys,
             brave_keys,
+            tavily_keys,
             cache,
         })
     }
@@ -201,6 +225,10 @@ impl Config {
         &self.brave_upstream_url
     }
 
+    pub fn tavily_upstream_url(&self) -> &Url {
+        &self.tavily_upstream_url
+    }
+
     pub fn bind_addr(&self) -> SocketAddr {
         self.bind_addr
     }
@@ -211,6 +239,10 @@ impl Config {
 
     pub fn brave_keys(&self) -> Option<&KeyPool> {
         self.brave_keys.as_ref()
+    }
+
+    pub fn tavily_keys(&self) -> Option<&KeyPool> {
+        self.tavily_keys.as_ref()
     }
 
     pub fn cache(&self) -> Option<&CacheConfig> {
@@ -224,6 +256,10 @@ impl Config {
                 SearchUpstream::Firecrawl => true,
                 SearchUpstream::Brave => self
                     .brave_keys
+                    .as_ref()
+                    .is_some_and(|pool| !pool.is_empty()),
+                SearchUpstream::Tavily => self
+                    .tavily_keys
                     .as_ref()
                     .is_some_and(|pool| !pool.is_empty()),
             }

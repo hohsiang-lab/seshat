@@ -18,6 +18,8 @@ Seshat and are never sent by Hermes.
   `/v2/scrape` both use the Firecrawl key pool.
 - Phase 2 (`SESHAT_SEARCH_UPSTREAM=brave`): `/v2/search` uses Brave Search and
   `/v2/scrape` continues to use Firecrawl. The two pools never cross-fallback.
+- Phase 3 (`SESHAT_SEARCH_UPSTREAM=tavily`): `/v2/search` uses Tavily and
+  `/v2/scrape` continues to use Firecrawl. The pools never cross-fallback.
 
 Every request selects an eligible key round-robin. Retryable transport errors,
 `401`, `403`, `408`, `425`, `429`, and `5xx` advance to another key at most
@@ -26,7 +28,7 @@ and `422` are returned without rotation.
 
 ## Configuration
 
-Required for both phases:
+Required for all phases:
 
 ```text
 SESHAT_TOKEN
@@ -40,6 +42,7 @@ SESHAT_BIND_ADDR=0.0.0.0:8080
 SESHAT_SEARCH_UPSTREAM=firecrawl
 FIRECRAWL_UPSTREAM_URL=https://api.firecrawl.dev
 BRAVE_SEARCH_UPSTREAM_URL=https://api.search.brave.com
+TAVILY_SEARCH_UPSTREAM_URL=https://api.tavily.com
 ```
 
 Phase 2 additionally requires:
@@ -48,11 +51,28 @@ Phase 2 additionally requires:
 BRAVE_SEARCH_API_KEYS_FILE=/run/secrets/brave-keys
 ```
 
+Phase 3 additionally requires:
+
+```text
+SESHAT_SEARCH_UPSTREAM=tavily
+TAVILY_SEARCH_API_KEYS_FILE=/run/secrets/tavily-keys
+```
+
 Key files contain one key per line. Blank lines are ignored and duplicate keys
 are removed while preserving order. File sources win over the local-only
-newline-separated `FIRECRAWL_API_KEYS` and `BRAVE_SEARCH_API_KEYS` fallbacks.
+newline-separated `FIRECRAWL_API_KEYS`, `BRAVE_SEARCH_API_KEYS`, and
+`TAVILY_SEARCH_API_KEYS` fallbacks.
 Never put credentials in this repository, request payloads, logs, image layers,
 workflow configuration, or artifacts.
+
+With Tavily selected, `/v2/search` sends a basic search request with
+`max_results`, `include_answer=false`, and `include_raw_content=false`. Tavily
+`content` becomes the Firecrawl-compatible `description`; complete page content
+still comes from `/v2/scrape` through Firecrawl. Scraping is fixed to Firecrawl
+in every phase and never uses the Tavily pool. A Tavily `429` advances to the
+next eligible key and applies the normal bounded process-local cooldown;
+`432`/`433` usage-limit responses return upstream unavailable without rotating
+the key.
 
 ## RustFS response cache
 

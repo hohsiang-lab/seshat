@@ -17,6 +17,7 @@ use crate::config::{Config, SearchUpstream};
 use crate::error::ApiError;
 use crate::providers::brave::BraveProvider;
 use crate::providers::firecrawl::FirecrawlProvider;
+use crate::providers::tavily::TavilyProvider;
 use crate::providers::{ScrapeInput, ScrapeResponse, SearchInput, SearchResponse};
 
 pub const MAX_REQUEST_BODY_BYTES: usize = 1024 * 1024;
@@ -31,6 +32,7 @@ pub struct AppState {
     search_upstream: SearchUpstream,
     firecrawl: FirecrawlProvider,
     brave: Option<BraveProvider>,
+    tavily: Option<TavilyProvider>,
     cache: Option<CacheStore>,
     ready: bool,
 }
@@ -43,6 +45,13 @@ impl AppState {
             config.firecrawl_upstream_url().clone(),
             config.firecrawl_keys().clone(),
         );
+        let tavily = config.tavily_keys().map(|pool| {
+            TavilyProvider::new(
+                client.clone(),
+                config.tavily_upstream_url().clone(),
+                pool.clone(),
+            )
+        });
         let brave = config.brave_keys().map(|pool| {
             BraveProvider::new(client, config.brave_upstream_url().clone(), pool.clone())
         });
@@ -51,6 +60,7 @@ impl AppState {
             search_upstream: config.search_upstream(),
             firecrawl,
             brave,
+            tavily,
             cache,
             ready: config.is_ready(),
         }
@@ -121,6 +131,14 @@ async fn search(
             SearchUpstream::Brave => {
                 state
                     .brave
+                    .as_ref()
+                    .ok_or(ApiError::UpstreamUnavailable)?
+                    .search(&input)
+                    .await
+            }
+            SearchUpstream::Tavily => {
+                state
+                    .tavily
                     .as_ref()
                     .ok_or(ApiError::UpstreamUnavailable)?
                     .search(&input)
@@ -388,6 +406,21 @@ mod tests {
         let state = AppState::new(config, reqwest::Client::new());
         assert!(state.cache.is_some());
         assert!(state.is_ready());
+    }
+
+    #[test]
+    fn tavily_selection_constructs_tavily_without_brave() {
+        let config = crate::config::Config::from_env_values(&std::collections::BTreeMap::from([
+            ("SESHAT_TOKEN".to_owned(), "auth".to_owned()),
+            ("SESHAT_SEARCH_UPSTREAM".to_owned(), "tavily".to_owned()),
+            ("FIRECRAWL_API_KEYS".to_owned(), "firecrawl".to_owned()),
+            ("TAVILY_SEARCH_API_KEYS".to_owned(), "tavily".to_owned()),
+        ]))
+        .expect("Tavily config should load");
+
+        let state = AppState::new(config, reqwest::Client::new());
+        assert!(state.tavily.is_some());
+        assert!(state.brave.is_none());
     }
 
     #[test]
