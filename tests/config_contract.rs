@@ -36,6 +36,28 @@ fn phase_two_requires_a_brave_pool() {
 }
 
 #[test]
+fn phase_three_selects_tavily_and_loads_its_pool() {
+    let config = Config::from_env_values(&vars(&[
+        ("SESHAT_TOKEN", "auth"),
+        ("SESHAT_SEARCH_UPSTREAM", "tavily"),
+        ("FIRECRAWL_API_KEYS", "firecrawl-key"),
+        ("TAVILY_SEARCH_API_KEYS", "tavily-alpha\ntavily-beta"),
+    ]))
+    .expect("phase three config should load");
+
+    assert_eq!(config.search_upstream(), SearchUpstream::Tavily);
+    assert_eq!(
+        config.tavily_upstream_url().as_str(),
+        "https://api.tavily.com/"
+    );
+    let tavily_keys = config.tavily_keys().expect("Tavily keys should load");
+    assert_eq!(tavily_keys.provider_name(), "tavily");
+    assert_eq!(tavily_keys.len(), 2);
+    assert!(config.brave_keys().is_none());
+    assert!(config.is_ready());
+}
+
+#[test]
 fn invalid_selector_fails_without_echoing_configuration_value() {
     let error = Config::from_env_values(&vars(&[
         ("SESHAT_TOKEN", "auth"),
@@ -55,6 +77,7 @@ fn upstream_urls_are_configurable_without_exposing_secrets() {
         ("FIRECRAWL_API_KEYS", "alpha"),
         ("FIRECRAWL_UPSTREAM_URL", "http://firecrawl.test"),
         ("BRAVE_SEARCH_UPSTREAM_URL", "http://brave.test"),
+        ("TAVILY_SEARCH_UPSTREAM_URL", "http://tavily.test"),
     ]))
     .expect("custom upstream URLs should parse");
 
@@ -63,6 +86,7 @@ fn upstream_urls_are_configurable_without_exposing_secrets() {
         "http://firecrawl.test/"
     );
     assert_eq!(config.brave_upstream_url().as_str(), "http://brave.test/");
+    assert_eq!(config.tavily_upstream_url().as_str(), "http://tavily.test/");
     assert!(!format!("{config:?}").contains("auth"));
     assert!(!format!("{config:?}").contains("alpha"));
 }
@@ -227,4 +251,5 @@ fn enabled_cache_rejects_invalid_ttls() {
 fn search_upstream_identifiers_are_stable() {
     assert_eq!(SearchUpstream::Firecrawl.as_str(), "firecrawl");
     assert_eq!(SearchUpstream::Brave.as_str(), "brave");
+    assert_eq!(SearchUpstream::Tavily.as_str(), "tavily");
 }
