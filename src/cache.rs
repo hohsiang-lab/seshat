@@ -215,6 +215,7 @@ fn sanitized_provider(provider: &str) -> Option<&'static str> {
     match provider {
         "firecrawl" => Some("firecrawl"),
         "brave" => Some("brave"),
+        "tavily" => Some("tavily"),
         _ => None,
     }
 }
@@ -650,5 +651,10 @@ mod tests {
             object_size_class(Some(MAX_CACHE_OBJECT_BYTES + 1)),
             ObjectSizeClass::Oversized
         );
+    }
+
+    #[test]
+    fn tavily_is_allowed_by_cache_provider_allowlist() {
+        assert_eq!(sanitized_provider("tavily"), Some("tavily"));
     }
 }
