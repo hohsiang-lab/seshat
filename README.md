@@ -12,6 +12,17 @@ Hermes points `FIRECRAWL_API_URL` at Seshat. Hermes' `FIRECRAWL_API_KEY` is the
 Seshat bearer token; upstream Firecrawl, Brave, and Tavily credentials stay
 inside Seshat and are never sent by Hermes.
 
+## Features
+
+- Firecrawl-compatible `/v2/search` and `/v2/scrape` endpoints, plus health and
+  readiness probes.
+- Search through Firecrawl (default), Brave, Tavily, or a combined Brave/Tavily
+  key pool. Scraping always stays on Firecrawl.
+- Provider key pools rotate through eligible keys sequentially and cool down
+  retryable failures; combined search never fans out or merges results.
+- Optional shared S3-compatible RustFS cache for successful search and scrape
+  responses.
+
 ## Routing phases
 
 - Phase 1 (`SESHAT_SEARCH_UPSTREAM=firecrawl`, the default): `/v2/search` and
@@ -154,13 +165,32 @@ approved deployment contract supplies them.
 
 - `GET /healthz` — liveness; no upstream call.
 - `GET /readyz` — checks loaded required pools; no upstream call.
-- `POST /v2/search` — Firecrawl-compatible `query` and bounded `limit`.
-- `POST /v2/scrape` — Firecrawl-compatible `url` and `formats` limited to
-  `markdown` and `html`.
+- `POST /v2/search` — non-empty `query` (up to 2,000 bytes); optional `limit`
+  defaults to `5` and must be between `1` and `20`.
+- `POST /v2/scrape` — `url` and optional `formats`; formats default to
+  `["markdown"]` and accept `markdown` and/or `html` (each at most once).
 
 The two data routes require configured bearer authentication. The SDK's
 `origin` field is accepted and ignored. Caller headers, actions, proxy
 settings, and arbitrary provider options are not forwarded.
+
+Example requests (assuming the default local bind address and an injected token):
+
+```bash
+curl -sS http://127.0.0.1:8080/v2/search \
+  -H "Authorization: Bearer ${SESHAT_TOKEN}" \
+  -H 'Content-Type: application/json' \
+  -d '{"query":"Rust async","limit":5}'
+
+curl -sS http://127.0.0.1:8080/v2/scrape \
+  -H "Authorization: Bearer ${SESHAT_TOKEN}" \
+  -H 'Content-Type: application/json' \
+  -d '{"url":"https://example.com","formats":["markdown"]}'
+```
+
+Search results are returned under `data.web[]` with `url`, `title`, and
+`description`; scrape output is returned under `data` with selected document
+formats and metadata.
 
 Seshat enforces URL scheme, userinfo, credential-query, DNS-resolved private /
 loopback / link-local / metadata destination, body-size, content-size, and
