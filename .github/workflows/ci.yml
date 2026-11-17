@@ -50,7 +50,7 @@ jobs:
             runner: staging-monster-amd64-ci
           - architecture: arm64
             platform: linux/arm64
-            runner: staging-monster-amd64-ci
+            runner: staging-monster-arm64-ci
     runs-on: ${{ matrix.runner }}
     permissions:
       contents: read
@@ -59,9 +59,6 @@ jobs:
     steps:
       - name: Checkout
         uses: actions/checkout@v4
-      # Monster amd64 builds arm64 using QEMU rather than native arm64 hardware.
-      - name: Set up QEMU
-        uses: docker/setup-qemu-action@v3
       - name: Set up Docker Buildx
         uses: docker/setup-buildx-action@v3
       - name: Log in to Docker Hub
