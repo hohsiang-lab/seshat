@@ -11,7 +11,7 @@ concurrency:
 
 jobs:
   checks:
-    runs-on: ubuntu-latest
+    runs-on: staging-monster-amd64-ci
     permissions:
       contents: read
     steps:
@@ -47,10 +47,10 @@ jobs:
         include:
           - architecture: amd64
             platform: linux/amd64
-            runner: ubuntu-24.04
+            runner: staging-monster-amd64-ci
           - architecture: arm64
             platform: linux/arm64
-            runner: ubuntu-24.04-arm
+            runner: staging-monster-amd64-ci
     runs-on: ${{ matrix.runner }}
     permissions:
       contents: read
@@ -59,6 +59,9 @@ jobs:
     steps:
       - name: Checkout
         uses: actions/checkout@v4
+      # Monster amd64 builds arm64 using QEMU rather than native arm64 hardware.
+      - name: Set up QEMU
+        uses: docker/setup-qemu-action@v3
       - name: Set up Docker Buildx
         uses: docker/setup-buildx-action@v3
       - name: Log in to Docker Hub
@@ -99,7 +102,7 @@ jobs:
   docker-publish:
     if: github.event_name == 'push' && github.ref == 'refs/heads/main'
     needs: docker-build
-    runs-on: ubuntu-24.04
+    runs-on: staging-monster-amd64-ci
     permissions:
       contents: read
     env:
